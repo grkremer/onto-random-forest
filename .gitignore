@@ -1,1 +1,7 @@
 go_data/
+data/cache/
+data/output/
+data/input/
+data/ontology/
+outdated/
+__pycache__/
