@@ -75,7 +75,7 @@ GO_OWL_URL    = "http://purl.obolibrary.org/obo/go.owl"
 W2V_VECTOR_SIZE = 128
 W2V_WINDOW      = 5
 W2V_MIN_COUNT   = 1
-W2V_EPOCHS      = 50
+W2V_EPOCHS      = 30
 
 NODE2VEC_NUM_WALKS   = 20
 NODE2VEC_WALK_LENGTH = 10
@@ -335,13 +335,13 @@ def plot_clusters(
 
 def gera_clusters_genes_com_mowl(data_name: str) -> None:
     """
-    Pipeline completo de geração de embeddings e clusterização de genes.
+    "tcga_full" em vez de "deepkegg", por se tratarem dos datasets completos.
 
     Parâmetros
     ----------
     data_name : str
         Nome do conjunto de dados (ex.: "BRCA", "PRAD"). Deve corresponder
-        a um diretório em data/input/deepkegg/<data_name>_data/.
+        a um diretório em data/input/tcga_full/<data_name>_data/.
     """
     log.info("=== Iniciando pipeline para %s ===", data_name)
 
@@ -354,7 +354,7 @@ def gera_clusters_genes_com_mowl(data_name: str) -> None:
     corpus_file = str(CACHE_DIR    / "corpus.txt")
 
     # --- Leitura dos genes de interesse ---
-    mRNA_path = INPUT_DIR / "deepkegg" / f"{data_name}_data" / "mRNA_data.csv"
+    mRNA_path = INPUT_DIR / "tcga_full" / f"{data_name}_data" / "mRNA_data.csv"
     mRNA_data = pd.read_csv(mRNA_path)
     genes = mRNA_data.columns[1:].tolist()   # ignora a coluna 'Case_ID'
     log.info("Total de genes carregados: %d", len(genes))
