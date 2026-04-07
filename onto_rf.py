@@ -492,3 +492,234 @@ class ClusterAwareRandomForestClassifier(RandomForestClassifier):
 
     def predict(self, X):
         return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+from sklearn.tree import DecisionTreeClassifier
+
+class LightClusterAwareRandomForestClassifier(RandomForestClassifier):
+    """
+    Random Forest guiado por clusters. Usa DecisionTreeClassifier (C/Cython) interno.
+    Ao invés de amostragem por nó, cada árvore inteira recebe um subconjunto de features
+    fortemente enviesado para um cluster aleatório.
+    """
+    def __init__(self, clusters: pd.DataFrame, feature_names=None,
+                 n_estimators=100, max_features="sqrt", max_depth=None,
+                 min_samples_split=2, min_samples_leaf=1, bootstrap=True,
+                 n_jobs=1, random_state=None, verbose=0):
+        super().__init__(n_estimators=n_estimators, max_features=max_features,
+                         max_depth=max_depth, min_samples_split=min_samples_split,
+                         min_samples_leaf=min_samples_leaf, bootstrap=bootstrap,
+                         n_jobs=n_jobs, random_state=random_state, verbose=verbose)
+        self.clusters = clusters
+        self.feature_names = feature_names
+
+    def _resolve_m(self, n_features):
+        mf = self.max_features
+        if mf == "sqrt":      return max(1, int(np.sqrt(n_features)))
+        if mf == "log2":      return max(1, int(np.log2(n_features)))
+        if isinstance(mf, float): return max(1, int(mf * n_features))
+        if isinstance(mf, int):   return mf
+        if mf is None:            return n_features
+        raise ValueError(f"max_features inválido: {mf!r}")
+
+    def _fit_single_tree(self, X, y, seed):
+        rng = check_random_state(seed)
+        if self.bootstrap:
+            idx = rng.choice(len(y), size=len(y), replace=True)
+            X_tree, y_tree = X[idx], y[idx]
+        else:
+            X_tree, y_tree = X, y
+
+        cluster_keys = list(self.clusters_.keys())
+        priority_key = rng.choice(cluster_keys)
+        
+        # Amostramos as features limitadas pela nossa quota priorizada
+        tree_features = _sample_features_priority(self.clusters_, priority_key, self.m_, rng)
+        
+        tree = DecisionTreeClassifier(
+            max_depth=self.max_depth,
+            min_samples_split=self.min_samples_split,
+            min_samples_leaf=self.min_samples_leaf,
+            max_features=None, # Usa todas que foram amostradas e passadas no slicing de X
+            random_state=rng.randint(0, 2**31)
+        )
+        tree.fit(X_tree[:, tree_features], y_tree)
+        tree.tree_features_ = tree_features
+        tree.priority_cluster_ = priority_key
+        return tree
+
+    def fit(self, X, y, sample_weight=None):
+        if isinstance(X, pd.DataFrame):
+            feature_names_ = list(X.columns)
+            X = X.values
+        elif self.feature_names is not None:
+            feature_names_ = list(self.feature_names)
+        else:
+            raise ValueError("Informe feature_names ou passe X como pd.DataFrame.")
+            
+        self.clusters_ = _clusters_from_dataframe(self.clusters, feature_names_)
+        self.feature_names_in_ = np.array(feature_names_)
+        self.classes_ = np.unique(y)
+        self.n_classes_ = len(self.classes_)
+        self.n_outputs_ = 1
+        self.n_features_in_ = X.shape[1]
+        
+        self.m_ = self._resolve_m(X.shape[1])
+        
+        y_enc = np.searchsorted(self.classes_, y)
+        rng = check_random_state(self.random_state)
+        seeds = rng.randint(0, 2**31, size=self.n_estimators)
+        
+        self.estimators_ = Parallel(n_jobs=self.n_jobs, verbose=self.verbose)(
+            delayed(self._fit_single_tree)(X, y_enc, int(s)) for s in seeds)
+            
+        self.tree_priority_clusters_ = [t.priority_cluster_ for t in self.estimators_]
+        return self
+
+    def predict_proba(self, X):
+        check_is_fitted(self)
+        if isinstance(X, pd.DataFrame): X = X.values
+        proba = np.zeros((X.shape[0], self.n_classes_))
+        for tree in self.estimators_:
+            tree_proba = tree.predict_proba(X[:, tree.tree_features_])
+            # Lidando com o caso onde a sub-amostra faltou alguma classe
+            if len(tree.classes_) != self.n_classes_:
+                mapped = np.zeros((X.shape[0], self.n_classes_))
+                for i, c in enumerate(tree.classes_):
+                    mapped[:, c] = tree_proba[:, i]
+                proba += mapped
+            else:
+                proba += tree_proba
+        return proba / len(self.estimators_)
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+
+class LightClusterWeightedRandomForestClassifier(RandomForestClassifier):
+    """
+    Wrapper RF Guiado por Clusters.
+    1. Treina um RF tradicional genérico para extrair a importância das features.
+    2. Tira a média de importância das features de cada cluster biológico para definir as probabilidades relativas.
+    3. Amostra as features para cada árvore do Ensemble Ponderado (DecisionTreeClassifier) baseada na probabilidade obtida no passo 2.
+    """
+    def __init__(self, clusters: pd.DataFrame, feature_names=None,
+                 n_estimators=100, max_features="sqrt", max_depth=None,
+                 min_samples_split=2, min_samples_leaf=1, bootstrap=True,
+                 n_jobs=1, random_state=None, verbose=0, n_estimators_base=150):
+        super().__init__(n_estimators=n_estimators, max_features=max_features,
+                         max_depth=max_depth, min_samples_split=min_samples_split,
+                         min_samples_leaf=min_samples_leaf, bootstrap=bootstrap,
+                         n_jobs=n_jobs, random_state=random_state, verbose=verbose)
+        self.clusters = clusters
+        self.feature_names = feature_names
+        self.n_estimators_base = n_estimators_base
+
+    def _resolve_m(self, n_features):
+        mf = self.max_features
+        if mf == "sqrt":      return max(1, int(np.sqrt(n_features)))
+        if mf == "log2":      return max(1, int(np.log2(n_features)))
+        if isinstance(mf, float): return max(1, int(mf * n_features))
+        if isinstance(mf, int):   return mf
+        if mf is None:            return n_features
+        raise ValueError(f"max_features invalido: {mf!r}")
+
+    def _fit_single_tree(self, X, y, seed, cluster_keys, cluster_probs):
+        rng = check_random_state(seed)
+        if self.bootstrap:
+            idx = rng.choice(len(y), size=len(y), replace=True)
+            X_tree, y_tree = X[idx], y[idx]
+        else:
+            X_tree, y_tree = X, y
+
+        priority_key = rng.choice(cluster_keys, p=cluster_probs)
+        tree_features = _sample_features_priority(self.clusters_, priority_key, self.m_, rng)
+        
+        tree = DecisionTreeClassifier(
+            max_depth=self.max_depth,
+            min_samples_split=self.min_samples_split,
+            min_samples_leaf=self.min_samples_leaf,
+            max_features=None,
+            random_state=rng.randint(0, 2**31)
+        )
+        tree.fit(X_tree[:, tree_features], y_tree)
+        tree.tree_features_ = tree_features
+        tree.priority_cluster_ = priority_key
+        return tree
+
+    def fit(self, X, y, sample_weight=None):
+        if isinstance(X, pd.DataFrame):
+            feature_names_ = list(X.columns)
+            X_arr = X.values
+        elif self.feature_names is not None:
+            feature_names_ = list(self.feature_names)
+            X_arr = X
+        else:
+            raise ValueError("Informe feature_names ou passe X como pd.DataFrame.")
+            
+        self.clusters_ = _clusters_from_dataframe(self.clusters, feature_names_)
+        self.feature_names_in_ = np.array(feature_names_)
+        self.classes_ = np.unique(y)
+        self.n_classes_ = len(self.classes_)
+        self.n_outputs_ = 1
+        self.n_features_in_ = X_arr.shape[1]
+        self.m_ = self._resolve_m(X_arr.shape[1])
+        
+        if self.verbose:
+            print(f"[Weighted-RF] Trainando RF base ({self.n_estimators_base} arvores) para importancias...")
+            
+        rf_base = RandomForestClassifier(
+            n_estimators=self.n_estimators_base,
+            max_features=self.max_features,
+            max_depth=self.max_depth,
+            n_jobs=self.n_jobs,
+            random_state=self.random_state
+        )
+        rf_base.fit(X_arr, y)
+        importances = rf_base.feature_importances_
+        
+        cluster_keys = list(self.clusters_.keys())
+        cluster_means = []
+        for k in cluster_keys:
+            idx = self.clusters_[k]
+            mean_imp = np.mean(importances[idx]) if len(idx) > 0 else 0.0
+            cluster_means.append(mean_imp)
+            
+        cluster_means = np.array(cluster_means)
+        if cluster_means.sum() == 0:
+            cluster_probs = np.ones(len(cluster_keys)) / len(cluster_keys)
+        else:
+            cluster_probs = cluster_means / cluster_means.sum()
+            
+        self.cluster_importances_ = dict(zip(cluster_keys, cluster_means))
+        
+        y_enc = np.searchsorted(self.classes_, y)
+        rng = check_random_state(self.random_state)
+        seeds = rng.randint(0, 2**31, size=self.n_estimators)
+        
+        if self.verbose:
+            print(f"[Weighted-RF] Trainando Ensemble Ponderado ({self.n_estimators} arvores)...")
+            
+        self.estimators_ = Parallel(n_jobs=self.n_jobs, verbose=self.verbose)(
+            delayed(self._fit_single_tree)(X_arr, y_enc, int(s), cluster_keys, cluster_probs) for s in seeds)
+            
+        self.tree_priority_clusters_ = [t.priority_cluster_ for t in self.estimators_]
+        return self
+
+    def predict_proba(self, X):
+        check_is_fitted(self)
+        if isinstance(X, pd.DataFrame): X = X.values
+        proba = np.zeros((X.shape[0], self.n_classes_))
+        for tree in self.estimators_:
+            tree_proba = tree.predict_proba(X[:, tree.tree_features_])
+            if len(tree.classes_) != self.n_classes_:
+                mapped = np.zeros((X.shape[0], self.n_classes_))
+                for i, c in enumerate(tree.classes_):
+                    mapped[:, c] = tree_proba[:, i]
+                proba += mapped
+            else:
+                proba += tree_proba
+        return proba / len(self.estimators_)
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
